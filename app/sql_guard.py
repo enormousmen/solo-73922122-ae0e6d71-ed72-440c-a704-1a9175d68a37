@@ -34,9 +34,12 @@ _SCHEMA_QUALIFIED_RE = re.compile(
 _TABLE_RE = re.compile(
     r"\b(?:from|join)\s+([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE
 )
-# CTE 定义名 WITH x AS ( ... )
+# CTE 定义名 WITH x AS ( ... ) 或 WITH x(col, ...) AS ( ... )，
+# 支持 WITH 后多个逗号分隔的 CTE
 _CTE_RE = re.compile(
-    r"\bwith\s+([A-Za-z_][A-Za-z0-9_]*)\s+as\s*\(", re.IGNORECASE
+    r"(?:\bwith\s+|,)\s*([A-Za-z_][A-Za-z0-9_]*)"
+    r"(?:\s*\([^)]*\))?\s+as\s*\(",
+    re.IGNORECASE,
 )
 # 字符串/数字/注释掩码，避免关键字绕过
 _STR_LITERAL_RE = re.compile(r"'(?:''|[^'])*'")
@@ -86,18 +89,34 @@ def validate_model_sql(
 
     cte_names = {m.group(1).lower() for m in _CTE_RE.finditer(stripped)}
 
-    # WITH 语句结构校验：最后一个右括号之后必须接最终 SELECT
+    # WITH 语句结构校验：所有 CTE 声明（可能逗号分隔多个、可带列别名列表
+    # WITH c(a,b) AS (...)）结束之后，必须接最终 SELECT。用 CTE 名正则锚定
+    # 每个 CTE 体的 AS ( 开括号，再做括号配对，避免把列别名列表/内部 JOIN
+    # 子查询括号误当作 CTE 边界。
     if lowered.startswith("with"):
+        cte_openings = [
+            m.end() - 1 for m in _CTE_RE.finditer(stripped)
+            if stripped[m.end() - 1] == "("
+        ]
+        if not cte_openings:
+            raise SqlValidationError(
+                "WITH 语句必须在 CTE 之后接最终的 SELECT 结果集"
+            )
+        # 最后一个 CTE 体的闭括号
+        open_idx = cte_openings[-1]
         depth = 0
-        last_close_tail = ""
-        for idx, ch in enumerate(stripped):
-            if ch == "(":
+        close_idx = -1
+        for idx in range(open_idx, len(stripped)):
+            if stripped[idx] == "(":
                 depth += 1
-            elif ch == ")":
+            elif stripped[idx] == ")":
                 depth -= 1
                 if depth == 0:
-                    last_close_tail = stripped[idx + 1:].strip(" ;").lower()
-        if not last_close_tail.startswith("select"):
+                    close_idx = idx
+                    break
+        tail = stripped[close_idx + 1:].strip(" \t\r\n;").lower() \
+            if close_idx >= 0 else ""
+        if not tail.startswith("select"):
             raise SqlValidationError(
                 "WITH 语句必须在 CTE 之后接最终的 SELECT 结果集"
             )

@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from . import runs_service, scheduler, services
 from .config import SOURCE_TABLES
+from .lineage import LineageError, list_traceable_columns, trace_column
 
 logging.basicConfig(
     level=logging.INFO,
@@ -176,6 +177,25 @@ def api_node_result(run_id: int, node_id: int):
     try:
         return runs_service.get_node_result(run_id, node_id)
     except runs_service.UploadError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# 列级血缘（基于批次冻结 SQL 与快照结果表，不受后续模型变更影响）
+# ---------------------------------------------------------------------------
+@app.get("/api/runs/{run_id}/lineage/columns")
+def api_lineage_columns(run_id: int):
+    try:
+        return list_traceable_columns(run_id)
+    except LineageError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.get("/api/runs/{run_id}/nodes/{node_id}/lineage")
+def api_node_lineage(run_id: int, node_id: int, column: str):
+    try:
+        return trace_column(run_id, node_id, column)
+    except LineageError as exc:
         raise HTTPException(404, str(exc)) from exc
 
 

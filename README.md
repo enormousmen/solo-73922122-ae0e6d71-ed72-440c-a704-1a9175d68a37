@@ -29,7 +29,23 @@ docker compose up --build
    依赖必须无环（Kahn 拓扑校验）。试跑进行中可改 SQL（供失败重试），
    但模型名/依赖等结构变更需等批次结束。
 3. **试跑批次**：启动试跑、查看每个节点状态与失败原因、查看结果表、
-   对失败批次点「重试」。
+   对失败批次点「重试」、对成功节点的结果列做**列级血缘追溯**。
+
+## 列级血缘（净额口径核对）
+
+在试跑批次详情或结果表弹窗中点选**模型 + 结果列**，即可沿该批次**冻结的
+SQL** 与上游模型结果列，逐段追溯到 `sales` / `refunds` 的源字段。
+
+- 支持预置模型的**聚合、JOIN、子查询（FROM / SELECT 标量）、单层 CTE**；
+- 表别名与同名列按 SQL **作用域**区分：`别名.列` 只在该别名关系内解析，
+  裸列名在全部 FROM/JOIN 关系中查找；重名且未限定的裸列判定为**歧义断点**，
+  不猜测来源；
+- 每一段引用关系都展示：起始列 → 引用别名 → 关系（源表/模型/CTE/子查询）→
+  转换方式（direct/aggregate/expression/star）→ 目标列，并标注层级；
+- 无法确定的分支（集合操作 UNION/INTERSECT/EXCEPT、窗口函数、嵌套 CTE、
+  `t.*`、常量列、上游节点失败等）会明确说明**停在哪个模型/子查询及原因**；
+- 追溯只读取 `run_nodes` 中冻结的 SQL 与快照 schema 内的结果表，**之后修改
+  或删除模型都不会改变旧批次的追溯结果**。
 
 ## 核心设计：如何保证数据时点一致
 
@@ -84,6 +100,8 @@ docker compose up --build
 | GET | `/api/runs`、`/api/runs/{id}` | 批次列表 / 详情（节点+事件+错误） |
 | POST | `/api/runs/{id}/retry` | 仅重跑失败/阻塞节点 |
 | GET | `/api/runs/{id}/nodes/{nid}/result` | 节点结果数据 |
+| GET | `/api/runs/{id}/lineage/columns` | 批次各成功节点可追溯的结果列清单 |
+| GET | `/api/runs/{id}/nodes/{nid}/lineage?column=列` | 单列列级血缘（引用边/源字段/断点） |
 
 ## 本地测试
 
@@ -97,7 +115,9 @@ pytest tests/ -q
 
 覆盖：SQL 守卫与 DAG 校验、成功试跑与结果、失败阻塞与其他分支继续、
 CSV 校验与回滚、改源表后重试的快照隔离、跨批次时点隔离、半成品表回滚、
-低权限角色写保护、模拟崩溃的重启恢复、并行执行观测、重试边界。
+低权限角色写保护、模拟崩溃的重启恢复、并行执行观测、重试边界、
+列级血缘（聚合/JOIN/子查询/单层 CTE、别名与同名列作用域、无法确定分支的
+断点、失败节点处理、改删模型不影响旧批次追溯）。
 
 ## 目录结构
 
@@ -110,6 +130,8 @@ app/dag.py             无环校验 / 拓扑排序
 app/scheduler.py       快照冻结、并行调度、失败阻塞、重试、重启恢复
 app/services.py        模型 CRUD 与校验
 app/runs_service.py    CSV 上传、批次/结果查询
+app/lineage/sql_parser.py    列级血缘用 SQL 分词器与递归下降解析器
+app/lineage/lineage_service.py  作用域解析与列追溯（只读冻结 SQL/快照）
 app/main.py            FastAPI 路由与生命周期
 app/web/               原生 JS 单页前端
 tests/                 端到端与恢复测试

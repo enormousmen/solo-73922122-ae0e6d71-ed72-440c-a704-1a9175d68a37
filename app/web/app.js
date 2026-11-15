@@ -267,8 +267,13 @@ window.retryRun = async function (id) {
 
 window.openRunDetail = async function (id) {
   try {
-    const d = await api(`/api/runs/${id}`);
+    const [d, lineageCols] = await Promise.all([
+      api(`/api/runs/${id}`),
+      api(`/api/runs/${id}/lineage/columns`),
+    ]);
     const r = d.run;
+    const colOf = {};
+    lineageCols.nodes.forEach((n) => { colOf[n.node_id] = n; });
     $("#run-detail").innerHTML = `
       <h3>试跑 #${r.id} ${STATUS_BADGE(r.status)}</h3>
       <div class="meta">
@@ -279,7 +284,7 @@ window.openRunDetail = async function (id) {
       <h4>节点（按依赖拓扑序）</h4>
       <div class="scroll">
       <table><thead><tr>
-        <th>#</th><th>模型</th><th>状态</th><th>上游</th><th>失败原因 / 结果</th>
+        <th>#</th><th>模型</th><th>状态</th><th>上游</th><th>失败原因 / 结果</th><th>列级血缘</th>
       </tr></thead><tbody>
       ${d.nodes.map((n, i) => `
         <tr>
@@ -294,6 +299,7 @@ window.openRunDetail = async function (id) {
             ${n.error ? `<pre class="sql" style="white-space:pre-wrap">${esc(n.error)}</pre>` : ""}
             ${n.status === "succeeded" ? `<button onclick='openResult(${r.id}, ${n.id})'>查看结果（${esc(n.result_table)}）</button>` : ""}
           </td>
+          <td>${renderLineageCell(r.id, n, colOf[n.id])}</td>
         </tr>`).join("")}
       </tbody></table></div>
       <h4>事件流</h4>
@@ -307,12 +313,102 @@ window.openRunDetail = async function (id) {
   }
 };
 
+function renderLineageCell(runId, node, colInfo) {
+  if (!colInfo || node.status !== "succeeded" || !colInfo.columns || !colInfo.columns.length) {
+    return `<span class="muted">节点未成功，无可追溯结果列</span>`;
+  }
+  return `
+    <div class="lineage-pick">
+      <select data-node-id="${node.id}" id="lineage-col-${node.id}">
+        ${colInfo.columns.map((c) => `<option value="${esc(c)}">${esc(c)}</option>`).join("")}
+      </select>
+      <button onclick='traceLineage(${runId}, ${node.id})'>追溯该列血缘</button>
+    </div>`;
+}
+
+window.traceLineage = async function (runId, nodeId) {
+  // 血缘入口同时存在于批次详情（lineage-col-<nodeId>）与结果弹窗（result-lineage-col）
+  const sel = $(`#lineage-col-${nodeId}`) || $("#result-lineage-col");
+  if (!sel || !sel.value) return toast("请先选择结果列", true);
+  const column = sel.value;
+  try {
+    const d = await api(
+      `/api/runs/${runId}/nodes/${nodeId}/lineage?column=${encodeURIComponent(column)}`);
+    renderLineageDialog(d);
+    $("#lineage-dialog").showModal();
+  } catch (e) {
+    toast(e.message, true);
+  }
+};
+
+function renderLineageDialog(d) {
+  const maxDepth = d.edges.reduce((m, e) => Math.max(m, e.depth), 0);
+  const edgeRows = d.edges.map((e) => `
+    <tr class="depth-${e.depth}">
+      <td>${e.depth}</td>
+      <td><code>${esc(e.from_model)}.${esc(e.from_column)}</code></td>
+      <td>${esc(e.via_alias || "—")}</td>
+      <td><span class="rel-kind ${esc(e.relation_kind)}">${esc(e.relation_kind)}</span>
+          ${e.relation ? `<code>${esc(e.relation)}</code>` : ""}</td>
+      <td><span class="transform ${esc(e.transform || "")}">${esc(e.transform || "—")}</span></td>
+      <td><span class="arrow">→</span> <strong>${esc(e.target_type)}</strong>
+          <code>${esc(e.target)}</code></td>
+    </tr>`).join("");
+
+  $("#lineage-detail").innerHTML = `
+    <h3>列级血缘：${esc(d.model_name)}.<code>${esc(d.target_column)}</code>
+      ${d.complete
+        ? '<span class="badge succeeded">已追溯到源字段</span>'
+        : '<span class="badge blocked">存在无法确定的断点</span>'}</h3>
+    <div class="meta">
+      <span>试跑 #${d.run_id}</span>
+      <span>快照: <code>${esc(d.snapshot_schema)}</code></span>
+      <span>节点状态: ${esc(d.node_status)}</span>
+    </div>
+
+    <h4>追溯链（每段为一次引用关系，depth ${maxDepth} 为最深层级）</h4>
+    <div class="scroll">
+      <table class="lineage-table"><thead><tr>
+        <th>层级</th><th>起始列</th><th>引用别名</th><th>关系</th><th>转换方式</th><th>目标</th>
+      </tr></thead><tbody>${edgeRows || `<tr><td colspan="6" class="muted">无可用引用边</td></tr>`}</tbody></table>
+    </div>
+
+    <h4>最终源字段（sales / refunds）</h4>
+    ${d.source_fields.length
+      ? `<ul class="leaf-list">${d.source_fields.map((f) =>
+          `<li><code>${esc(f.table)}.${esc(f.column)}</code></li>`).join("")}</ul>`
+      : `<p class="muted">未追溯到任何源字段。</p>`}
+
+    <h4>无法确定的分支（不猜测来源）</h4>
+    ${d.blocked.length
+      ? d.blocked.map((b) => `
+        <div class="blocked-box">
+          <strong>停在模型：${esc(b.model || "—")}（节点 #${b.node_id ?? "—"}）</strong>
+          <div>列：<code>${esc(b.column)}</code></div>
+          <div class="reason">原因：${esc(b.reason)}</div>
+        </div>`).join("")
+      : `<p class="muted">无断点，所有分支均已确定。</p>`}
+
+    <details class="frozen-sql">
+      <summary>查看该批次冻结的 SQL</summary>
+      <pre class="sql">${esc(d.frozen_sql)}</pre>
+    </details>`;
+}
+
 window.openResult = async function (runId, nodeId) {
   try {
     const d = await api(`/api/runs/${runId}/nodes/${nodeId}/result`);
     $("#result-detail").innerHTML = `
       <h3>${esc(d.model_name)} 的结果
         <span class="muted">（表 ${esc(d.result_table)}，共 ${d.total} 行，预览前 ${d.rows.length} 行）</span></h3>
+      <div class="lineage-pick">
+        <label>选择结果列追溯血缘：
+          <select id="result-lineage-col">
+            ${d.columns.map((c) => `<option value="${esc(c)}">${esc(c)}</option>`).join("")}
+          </select>
+        </label>
+        <button class="primary" onclick='traceLineage(${runId}, ${nodeId})'>追溯该列血缘</button>
+      </div>
       <div class="scroll">
       <table><thead><tr>${d.columns.map((c) => `<th>${esc(c)}</th>`).join("")}</tr></thead>
       <tbody>${d.rows.map((row) => `<tr>${d.columns.map((c) => `<td>${esc(row[c])}</td>`).join("")}</tr>`).join("")}</tbody></table>
